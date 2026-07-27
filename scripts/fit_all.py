@@ -109,6 +109,7 @@ def train_flow_conditional(
     data_fname=None,
     training_method="OTFlowMatching",
     time_scheduler_type="uniform",
+    time_scheduler_param=2.0,
     ot_pairings_opts={},
     seed=0,
     validation_frac=0.25,
@@ -117,6 +118,7 @@ def train_flow_conditional(
     conditional_velocity_flow_opts={},
     time_logger=None,
     reset_flow_lr=False,
+    no_data_shuffling=False,
     extra_kw=dict(),
 ):
     """
@@ -132,7 +134,8 @@ def train_flow_conditional(
         ot_pairings_opts (dict): Dictionary of the params required for precomputing
             OT pairings. If empty, OT pairings are not used.
         time_scheduler_type (str): Type of time scheduler for flow matching.
-        seed (int): Random seed for reproducibility.
+        time_scheduler_param (float): Parameter for the time scheduler (e.g., power for power law).
+        seed (int): Random seed for reproducibility. We also make it shuffle the train-test split in a reproducible way.
         n_epochs (int): Number of training epochs.
         batch_size (int): Number of samples per training batch.
         validation_frac (float): Fraction of data to use for validation.
@@ -149,6 +152,11 @@ def train_flow_conditional(
     """
     key = jax.random.key(seed)
 
+    if not no_data_shuffling:
+        # Shuffle data in a reproducible way
+        rng = np.random.default_rng(seed)
+        permutation = rng.permutation(len(data["eta"]))
+        data = {k: v[permutation] for k, v in data.items()}
     train_data, val_data = utils.split_data(data, validation_frac)
     n_samples = train_data["eta"].shape[0]
     dim = train_data["eta"].shape[1]
@@ -220,8 +228,8 @@ def train_flow_conditional(
             schedule_type=lr_opts["type"], lr_final=lr_opts.get("final", None),
             train_data=train_data, val_data=val_data,
             norm_mean=data_mean, norm_std=data_std, epochs=n_epochs, batch_size=batch_size,
-            time_scheduler_type=time_scheduler_type, loss_params=loss_opts,
-            time_logger=time_logger, loss_history=loss_history,
+            time_scheduler_type=time_scheduler_type, time_scheduler_param=time_scheduler_param,
+            loss_params=loss_opts, time_logger=time_logger, loss_history=loss_history,
             checkpoint_frequency_epochs=checkpoint_frequency_epochs
         )
         if train_ot:
@@ -250,6 +258,7 @@ def train_flow(
     training_method="OTFlowMatching",
     ot_pairings_opts={},
     time_scheduler_type="uniform",
+    time_scheduler_param=2.0,
     seed=0,
     n_epochs=100,
     batch_size=5000,
@@ -274,6 +283,7 @@ def train_flow(
         ot_pairings_opts (dict): Dictionary of the params required for precomputing
             OT pairings. If empty, OT pairings are not used.
         time_scheduler_type (str): Type of time scheduler for flow matching.
+        time_scheduler_param (float): Parameter for the time scheduler (e.g., power for power law).
         seed (int): Random seed for reproducibility.
         n_epochs (int): Number of training epochs.
         batch_size (int): Number of samples per training batch.
@@ -344,8 +354,8 @@ def train_flow(
                   schedule_type=lr_opts["type"], lr_final=lr_opts.get("final", None),
                   train_data=train_data, val_data=val_data,
                   norm_mean=data_mean, norm_std=data_std, epochs=n_epochs, batch_size=batch_size,
-                  time_scheduler_type=time_scheduler_type, loss_params=loss_opts,
-                  time_logger=time_logger, loss_history=loss_history,
+                  time_scheduler_type=time_scheduler_type, time_scheduler_param=time_scheduler_param,
+                  loss_params=loss_opts, time_logger=time_logger, loss_history=loss_history,
                   checkpoint_frequency_epochs=checkpoint_frequency_epochs)
     if training_method == "OTFlowMatching":
         ot_pairings_dir = Path(data_fname).parent / "ot_pairings" / f"pairings_{Path(data_fname).stem}_seed{ot_pairings_opts['seed']}"
@@ -389,7 +399,8 @@ def train_potential(
     benchmark_after_first_loop=True,
     benchmarking_args={},
     timeout_hours=None,
-    ignore_nobs=False
+    ignore_nobs=False,
+    no_data_shuffling=False,
 ):
     """
     Initializes and trains the gravitational potential model.
@@ -402,7 +413,9 @@ def train_potential(
         potential_dir (Path): Directory to save the potential model.
         seed (int): Random seed.
         loss_opts (dict): Options for the loss function.
-        potential_nn_opts (dict): Options for the potential neural network.
+        potential_nn_opts (dict): Options for the potential model. Supports:
+            - Neural network types: 'ResNet', 'MLP' (require 'width', 'depth')
+            - Analytic type: 'Analytic' (requires mn1_*, mn2_*, halo_* params)
         lr_opts (dict): Options for the learning rate schedule.
         n_epochs (int): Number of training epochs.
         batch_size (int): Training batch size.
@@ -417,13 +430,21 @@ def train_potential(
     key = jax.random.key(seed)
     n_samples = df_data["eta"].shape[0]
 
+    if not no_data_shuffling:
+        # Shuffle data in a reproducible way
+        rng = np.random.default_rng(seed)
+        permutation = rng.permutation(len(df_data["eta"]))
+        df_data = {k: v[permutation] for k, v in df_data.items()}
     # Make the model
     key, subkey = jax.random.split(key)
     n_val = int(validation_frac * n_samples)
     scale = np.std(df_data['eta'][:n_samples - n_val,:3], axis=0).tolist()
+
+    # Set scale for coordinate normalization (used by neural network types, ignored by Analytic)
     potential_nn_opts["scale"] = scale
     if selection_function_opts is not None:
         selection_function_opts["scale"] = scale
+
     potential_model = potential.PotentialModel(
         subkey, potential_dir, phi_params=potential_nn_opts, frameshift_params=frameshift_opts,
         selection_function_params=selection_function_opts
@@ -476,9 +497,20 @@ def load_flow(flow_dir, checkpoint_index=-1, load_history=False, old_style=False
 
 
 def load_potential(potential_dir, checkpoint_index=-1, load_history=False):
-    # Loads a trained PotentialModel from a specified directory.
-    # Currently assumes a 6D input
-    potential_model, loss_history = potential.PotentialModel.load(Path(potential_dir), load_index=checkpoint_index, load_history=load_history)
+    """
+    Loads a trained PotentialModel from a specified directory.
+
+    Args:
+        potential_dir: Directory containing the potential model.
+        checkpoint_index: Index of checkpoint to load (-1 for latest).
+        load_history: Whether to load the loss history.
+
+    Returns:
+        The loaded potential model, and optionally the loss history.
+    """
+    potential_model, loss_history = potential.PotentialModel.load(
+        Path(potential_dir), load_index=checkpoint_index, load_history=load_history
+    )
 
     if load_history:
         return potential_model, loss_history
@@ -560,6 +592,16 @@ def main():
         help="Train the flow. If not set, the flow is loaded from flow-dir.",
     )
     parser.add_argument(
+        "--no-data-shuffling",
+        action="store_true",
+        help="Whether to shuffle the data before training. By default, the data is shuffled in a reproducible way based on the seed.",
+    )
+    parser.add_argument(
+        "--flow-ignore-weights",
+        action="store_true",
+        help="Ignore weights when training the flow.",
+    )
+    parser.add_argument(
         "--flow-sampling",
         action="store_true",
         help="Sample from the flow. If not set, the flow samples are loaded in when necessary.",
@@ -636,6 +678,8 @@ def main():
     # ================= Loading in training data ==================
     # Attrs contain info basic spatial limits on the data
     data, attrs = utils.load_training_data(args.input)
+    if args.flow_ignore_weights:
+        data['weights'] = np.ones_like(data['weights'])
 
     # ================= Training/loading the flow =================
     if args.flow_training:
@@ -649,7 +693,8 @@ def main():
         flow, loss_history = train_flow_conditional(
             data, flow_dir, args.input, **params["df"],
             reset_flow_lr=args.reset_flow_lr,
-            time_logger=time_logger
+            time_logger=time_logger,
+            no_data_shuffling=args.no_data_shuffling,
         )
         time_logger.stop('Flow training')
         print(f"Training took {time_logger.get_duration('Flow training'):.2f} s.")
@@ -715,10 +760,8 @@ def main():
             # Update df_data to include only the data within the mask
             print(f"Applying potential mask from {args.potential_mask} ...")
             mask = utils.get_mask_eta(df_data["eta"], args.potential_mask)[0]
-        df_data["eta"] = df_data["eta"][mask]
-        df_data["df_deta"] = df_data["df_deta"][mask]
-        if "f" in df_data:
-            df_data["f"] = df_data["f"][mask]
+        for key in df_data:
+            df_data[key] = df_data[key][mask]
 
     # ================= Training the potential =================
     if args.potential_training:
@@ -731,6 +774,7 @@ def main():
             potential_dir,
             **params["Phi"],
             ignore_nobs=args.potential_ignore_nobs,
+            no_data_shuffling=args.no_data_shuffling,
             benchmark_after_first_loop=args.basic_potential_benchmarking,
             benchmarking_args=dict(fname_mask=args.potential_mask, data_train=data, attrs_train=attrs, df_data=df_data,
                                    is_gaia=args.basic_potential_benchmarking_gaia_units),
@@ -756,6 +800,7 @@ def main():
             fname_mask, data, attrs, df_data,
             spherical_origin, cylindrical_origin,
             is_gaia=args.basic_potential_benchmarking_gaia_units,
+            plot_ntrue=~args.potential_ignore_nobs,
         )
 
     return 0

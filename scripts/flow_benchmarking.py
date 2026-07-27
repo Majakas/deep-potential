@@ -559,7 +559,7 @@ if __name__ == '__main__':
     fig_dir = Path(args.fig_dir)
     fig_dir.mkdir(parents=True, exist_ok=True)
 
-    data, attrs = utils.load_training_data(args.input)
+    data, attrs = utils.load_training_data(args.input, cut_attrs=True)
 
     train_data, val_data = utils.split_data(data, params["df"]["validation_frac"])
     df_data = utils.load_flow_samples(args.df_grads_fname)

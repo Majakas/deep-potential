@@ -13,3 +13,7 @@ flowjax
 e3nn-jax
 jax
 jaxlib
+snakemake
+snakemake-executor-plugin-slurm
+progressbar
+cmasher

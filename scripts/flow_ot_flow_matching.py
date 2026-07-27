@@ -421,6 +421,7 @@ def train_ot_flow_matching_model(
     batch_size: int,
     ot_pairings_dir: Path,
     time_scheduler_type=None,
+    time_scheduler_param=2.0,
     loss_params={},
     time_logger=None,
     loss_history={'train': [], 'val': [], 'lr': []},
@@ -444,7 +445,7 @@ def train_ot_flow_matching_model(
     path_val_ot = ot_pairings_dir / "val_epochs"
     x0_x1_val_indices_loader = PrecomputedOTDataLoader(path_val_ot, n=n_val, x1_data=val_x, w1_weights=val_weights)
 
-    time_scheduler = get_time_scheduler(time_scheduler_type)
+    time_scheduler = get_time_scheduler(time_scheduler_type, time_scheduler_param)
 
     # --- Partition Model into trainable/non-trainable parts and initialize the optimizer ---
     params, static = eqx.partition(dynamics_net, filter_spec=custom_filter_spec(dynamics_net))
@@ -461,6 +462,7 @@ def train_ot_flow_matching_model(
     print(f"Number of steps per epoch: {steps_per_epoch}, Batch size: {batch_size}")
     print(f"Number of epochs: {epochs}, Total training samples: {n_train}")
     print(f"Using time scheduler of type {time_scheduler}")
+    print(f"Using time scheduler parameter: {time_scheduler_param}")
     print(f"Using loss params {loss_params}")
     start_epoch = len(loss_history['lr'])
     step = start_epoch * steps_per_epoch  # Continue from previous step if resuming

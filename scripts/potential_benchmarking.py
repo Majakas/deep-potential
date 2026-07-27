@@ -131,7 +131,7 @@ def plot_2d_slice_pot(phi_model, coords_ref, dim1, dim2, dim_plot, fig_dir, z_fi
         mask = ~((r_grid < attrs['r_out']) & (r_grid > attrs['r_in']))
 
     # Calculate the model rho
-    phi, acc, rho = utils.get_model_values(phi_model, q_grid, disable_tqdm=True, convert_rho_to_msunpc3=is_gaia)
+    phi, acc, rho = utils.get_phi_values(phi_model, q_grid, disable_tqdm=True, convert_rho_to_msunpc3=is_gaia)
     phi = phi.flatten()
     if dim_plot == 'phi':
         values = phi
@@ -171,7 +171,7 @@ def plot_2d_slice_pot(phi_model, coords_ref, dim1, dim2, dim_plot, fig_dir, z_fi
 def plot_2d_slices(phi_model, coords_grid, dim1, dim2, attrs, fig_dir=None, fig_fmt=('png',),
                    fname_mask=None, is_gaia=True, value_type='rho'):
     """
-    Plots 2D slices of density (rho) or selection function.
+    Plots 2D slices of density (rho), selection function, or true n(x) (ntrue).
 
     Args:
         phi_model: The potential model
@@ -182,7 +182,7 @@ def plot_2d_slices(phi_model, coords_grid, dim1, dim2, attrs, fig_dir=None, fig_
         fig_fmt: Output formats
         fname_mask: Mask filename
         is_gaia: Whether to use Gaia-specific formatting
-        value_type: 'rho' for density or 'selfn' for selection function
+        value_type: 'rho' for density, 'selfn' for selection function, or 'ntrue' for n_true(x)
     """
     labels, _, keys = get_labels_and_keys(is_gaia)
 
@@ -214,14 +214,18 @@ def plot_2d_slices(phi_model, coords_grid, dim1, dim2, attrs, fig_dir=None, fig_
     # Configure based on value type
     if value_type == 'rho':
         kw = dict(cmap='cmr.rainforest', vmin=0, rasterized=True)
-        if is_gaia:
-            kw['vmax'] = 0.15
+        # if is_gaia:
+        #     kw['vmax'] = 0.15
         title = '$\\rho_\\mathrm{{\\ (M_\\odot/pc^3)}}$' if is_gaia else '$\\rho_\\mathrm{{model}}$'
         fname_base = f'2d_rho_slices_{dim1}_{dim2}'
-    else:  # selfn
+    elif value_type == 'selfn':  # selfn
         kw = dict(cmap='viridis', vmin=0, vmax=None, rasterized=True)
         title = 'Selection Function'
         fname_base = f'2d_selfn_slices_{dim1}_{dim2}'
+    elif value_type == 'ntrue':
+        kw = dict(cmap='viridis', vmin=0, vmax=None, rasterized=True)
+        title = r'$n_\mathrm{true}$'
+        fname_base = f'2d_ntrue_slices_{dim1}_{dim2}'
 
     # The z values are chosen at 37.5%, 50% and 62.5% of the 3rd data dimension
     z_lims = get_lims(coords_grid[dim3])
@@ -237,9 +241,11 @@ def plot_2d_slices(phi_model, coords_grid, dim1, dim2, attrs, fig_dir=None, fig_
 
         # Calculate values based on type
         if value_type == 'rho':
-            values = utils.get_model_values(phi_model, q_grid, disable_tqdm=True, convert_rho_to_msunpc3=is_gaia)[2]
-        else:
+            values = utils.get_phi_values(phi_model, q_grid, disable_tqdm=True, convert_rho_to_msunpc3=is_gaia)[2]
+        elif value_type == 'selfn':
             values = utils.get_selfn_values(phi_model, q_grid, disable_tqdm=True)[0]
+        elif value_type == 'ntrue':
+            values = utils.get_n_values(phi_model, q_grid, disable_tqdm=True)[0]
 
         values = np.ma.masked_where(mask, values)
         values = np.reshape(values, X.shape)
@@ -248,15 +254,10 @@ def plot_2d_slices(phi_model, coords_grid, dim1, dim2, attrs, fig_dir=None, fig_
         hh = ax.pcolormesh(x, y, values, **kw)
 
         # Add text label for the z value
-        z_label = keys[keys.index(dim3)] if value_type == 'rho' else labels[dim3].replace('$', '')
-        if value_type == 'rho':
-            text = f'${z_label}={z_fill:.2f}$'
-            if is_gaia:
-                text += ' kpc'
-        else:
-            text = f'${z_label}={z_fill:.2f}$'
-            if is_gaia:
-                text = f'${z_label[0]}={z_fill:.2f}$ kpc'
+        z_label = keys[keys.index(dim3)]
+        text = f'${z_label}={z_fill:.2f}$'
+        if is_gaia:
+            text += ' kpc'
 
         t = ax.text(0.04, 0.92, text, transform=ax.transAxes, fontsize=8, color='black')
         t.set_bbox(dict(facecolor='white', alpha=0.5, edgecolor='none'))
@@ -339,6 +340,10 @@ def plot_potential_param_evolution(potential_params_hist, fig_dir, fig_fmt=("png
 
     non_constant_params = []
     for i, (label, values) in enumerate(potential_params_hist.items()):
+        if 'log' in label:
+            values = np.exp(values)
+            label = label.replace('log', '')
+
         if label not in label_converter:
             print(f"{label} not in label converter")
         else:
@@ -612,7 +617,7 @@ def plot_1d_rho(coords_grid, rho_grid, dim, fig_dir, fig_fmt, gamma=0.7, is_gaia
     ylabel = '$\\rho$'
     if is_gaia:
         ylabel += '$\mathrm{\ (M_\odot/pc^3)}$'
-    
+
     plot_2dhist_custom(
         coords_grid[dim], rho_grid, np.ones(len(rho_grid)), operation=np.sum,
         xlabel=labels[dim], ylabel=ylabel,
@@ -660,6 +665,40 @@ def plot_1d_selfn(coords_grid, selfn_grid, dim, fig_dir, fig_fmt, gamma=0.7, is_
     if fig_dir is not None:
         for fmt in fig_fmt:
             fname = fig_dir / f'1d_selfn_{dim}_marginal.{fmt}'
+            fig.savefig(fname, dpi=dpi, bbox_inches='tight')
+        plt.close(fig)
+
+
+def plot_1d_ntrue(coords_grid, ntrue_grid, dim, fig_dir, fig_fmt, gamma=0.7, is_gaia=True):
+    """
+    Makes a 1d plot of the true n(x) as a function of a dimension, marginalizing over the other
+    spatial dimensions.
+    """
+    labels, _, _ = get_labels_and_keys(is_gaia)
+    fig, (ax, cax) = plt.subplots(1, 2, figsize=(3.6, 3), width_ratios=[3, 0.1], layout='compressed')
+
+    cmap = 'Greys'
+    ylabel = r'$n_\mathrm{true}$'
+    if is_gaia:
+        ylabel += r'$\mathrm{\ (kpc^{-3})}$'
+
+    plot_2dhist_custom(
+        coords_grid[dim], ntrue_grid, np.ones(len(ntrue_grid)), operation=np.sum,
+        xlabel=labels[dim], ylabel=ylabel,
+        norm=colors.PowerNorm(vmin=0, gamma=gamma), bins=(81, 128),
+        lims=[get_lims(coords_grid[dim]), get_lims(ntrue_grid, False)],
+        normalize_along_axis=2,
+        fig=fig, ax=ax, cax=cax, cmap=cmap,
+        cax_label='Normalized count',
+    )
+
+    ax.yaxis.set_minor_locator(ticker.AutoMinorLocator(5))
+    ax.xaxis.set_minor_locator(ticker.AutoMinorLocator(5))
+    ax.set_box_aspect(1)
+
+    if fig_dir is not None:
+        for fmt in fig_fmt:
+            fname = fig_dir / f'1d_ntrue_{dim}_marginal.{fmt}'
             fig.savefig(fname, dpi=dpi, bbox_inches='tight')
         plt.close(fig)
 
@@ -794,8 +833,8 @@ def plot_2d_rho(coords_grid, rho_grid, r0, fig_dir=None, fig_fmt=('png',), is_ga
         cax_label += '$\mathrm{\,(M_\odot/pc^3)}$'
     cax_nbins = 4
     vmax = None
-    if is_gaia:
-        vmax = 0.15
+    # if is_gaia:
+    #     vmax = 0.15
     bins = (161, 161)
 
     x, y, values, xlabel, ylabel, z_lim = get_xyz('x', 'y', 'z')
@@ -841,7 +880,7 @@ def get_potential_dfdt(phi_model, df_data, dphi_dq):
     """ Returns the \partial f/\partial t predicted by the potential in the associated rotating frame.
     """
     eta = df_data['eta']
-    df_deta = df_data['dlnf_deta'] * np.exp(df_data['lnf'])
+    df_deta = df_data['dlnf_deta'] * np.exp(df_data['lnf'])[:, None]
 
     fs = phi_model.frameshift_model
     model_omega = float(fs.omega)
@@ -1048,7 +1087,12 @@ def create_random_grid(attrs_train, fname_mask, n_points=100000, batch_size=-1, 
     return q_grids[:n_grid]
 
 
-def benchmark_potential(phi_model, loss_history, fname_mask, data_train, attrs_train, df_data, spherical_origin=(0.0, 0.0, 0.0), cylindrical_origin=(8.277, 0.0, 0.0), fig_fmt=('png',), checkpoint_index=None, is_gaia=True):
+def benchmark_potential(
+    phi_model, loss_history, fname_mask, data_train, attrs_train, df_data,
+    spherical_origin=(0.0, 0.0, 0.0), cylindrical_origin=(8.277, 0.0, 0.0),
+    fig_fmt=('png',), checkpoint_index=None, is_gaia=True,
+    plot_ntrue=False,
+):
     if checkpoint_index is None:
         checkpoint_index = phi_model.checkpoint_index
     save_dir = Path(str(phi_model.model_dir).replace('models', 'plots'))
@@ -1093,26 +1137,37 @@ def benchmark_potential(phi_model, loss_history, fname_mask, data_train, attrs_t
         q_grid = create_random_grid(attrs_train, fname_mask, n_points=n_points)
         np.save(fname, q_grid)
     coords_grid = utils.calc_coords(q_grid, spherical_origin, cylindrical_origin)
-    phi_grid, acc_grid, rho_grid = utils.get_model_values(phi_model, q_grid, convert_rho_to_msunpc3=is_gaia) # , fname=save_dir / 'potential_grid_values.npz')
+    phi_grid, acc_grid, rho_grid = utils.get_phi_values(phi_model, q_grid, convert_rho_to_msunpc3=is_gaia) # , fname=save_dir / 'potential_grid_values.npz')
     acc_components_grid = utils.calc_coords(q_grid, spherical_origin, cylindrical_origin, vector_field=acc_grid)
     r0 = cylindrical_origin[0]
     if r0 < 1e-8:
         r0 = 1
     has_selfn = phi_model.log_selection_function_model is not None
     if has_selfn:
-        fname = save_dir / f'selfn_grid_values{n_points}.npy'
-        selfn_grid = utils.get_selfn_values(phi_model, q_grid)[0] # , fname=fname)
+        if plot_ntrue:
+            ntrue_grid = utils.get_n_values(phi_model, q_grid)[0] # , fname=fname)
+        else:
+            selfn_grid = utils.get_selfn_values(phi_model, q_grid)[0] # , fname=fname)
 
 
     # ------------- Plotting ----------------
     if has_selfn:
-        print("Plotting 2D histogram of selection function slices ...")
-        for dim1, dim2 in [('x', 'y'), ('x', 'z'), ('y', 'z')]:
-            plot_2d_slices_selfn(phi_model, coords_grid, dim1, dim2, attrs_train, fig_dir=save_dir, fig_fmt=fig_fmt, fname_mask=fname_mask, is_gaia=is_gaia)
+        if plot_ntrue:
+            print("Plotting 2D histogram of n_true slices ...")
+            for dim1, dim2 in [('x', 'y'), ('x', 'z'), ('y', 'z')]:
+                plot_2d_slices(phi_model, coords_grid, dim1, dim2, attrs_train, fig_dir=save_dir, fig_fmt=fig_fmt, fname_mask=fname_mask, is_gaia=is_gaia, value_type='ntrue')
 
-        print("Plotting 1D histogram of selection function ...")
-        for dim in ['x', 'y', 'z', 'r', 'cylR', 'cylphi']:
-            plot_1d_selfn(coords_grid, selfn_grid, dim, fig_dir=save_dir, fig_fmt=fig_fmt, gamma=0.7, is_gaia=is_gaia)
+            print("Plotting 1D histogram of n_true ...")
+            for dim in ['x', 'y', 'z', 'r', 'cylR', 'cylphi']:
+                plot_1d_ntrue(coords_grid, ntrue_grid, dim, fig_dir=save_dir, fig_fmt=fig_fmt, gamma=0.7, is_gaia=is_gaia)
+        else:
+            print("Plotting 2D histogram of selection function slices ...")
+            for dim1, dim2 in [('x', 'y'), ('x', 'z'), ('y', 'z')]:
+                plot_2d_slices(phi_model, coords_grid, dim1, dim2, attrs_train, fig_dir=save_dir, fig_fmt=fig_fmt, fname_mask=fname_mask, is_gaia=is_gaia, value_type='selfn')
+
+            print("Plotting 1D histogram of selection function ...")
+            for dim in ['x', 'y', 'z', 'r', 'cylR', 'cylphi']:
+                plot_1d_selfn(coords_grid, selfn_grid, dim, fig_dir=save_dir, fig_fmt=fig_fmt, gamma=0.7, is_gaia=is_gaia)
 
     print("Plotting 1D histogram of accelerations ...")
     plot_1d_acc(coords_grid, acc_components_grid, r0, fig_dir=save_dir, fig_fmt=fig_fmt, gamma=0.7, is_gaia=is_gaia)
@@ -1123,7 +1178,7 @@ def benchmark_potential(phi_model, loss_history, fname_mask, data_train, attrs_t
 
     print("Plotting 2D histogram of matter density slices ...")
     for dim1, dim2 in [('x', 'y'), ('x', 'z'), ('y', 'z')]:
-        plot_2d_slices_rho(phi_model, coords_grid, dim1, dim2, attrs_train, fig_dir=save_dir, fig_fmt=fig_fmt, fname_mask=fname_mask, is_gaia=is_gaia)
+        plot_2d_slices(phi_model, coords_grid, dim1, dim2, attrs_train, fig_dir=save_dir, fig_fmt=fig_fmt, fname_mask=fname_mask, is_gaia=is_gaia, value_type='rho')
 
     print("Plotting 2D integrated histograms of accelerations ...")
     plot_2d_acc(coords_grid, acc_components_grid, r0, fig_dir=save_dir, fig_fmt=fig_fmt, is_gaia=is_gaia)
@@ -1131,7 +1186,7 @@ def benchmark_potential(phi_model, loss_history, fname_mask, data_train, attrs_t
     print("Plotting 2D integrated histograms of densities ...")
     plot_2d_rho(coords_grid, rho_grid, r0, fig_dir=save_dir, fig_fmt=fig_fmt, is_gaia=is_gaia)
 
-    phi, acc, rho = utils.get_model_values(phi_model, df_data['eta'][:,:3], convert_rho_to_msunpc3=is_gaia) # , fname=save_dir / 'potential_train_values.npz')
+    phi, acc, rho = utils.get_phi_values(phi_model, df_data['eta'][:,:3], convert_rho_to_msunpc3=is_gaia) # , fname=save_dir / 'potential_train_values.npz')
     print("Plotting 2D marginals of non-stationarities ...")
     for dim1, dim2 in [('x', 'y'), ('z', 'vz'), ('cylvR', 'cylvT')]:
         # Make the plot for the innermost 50% of the radii

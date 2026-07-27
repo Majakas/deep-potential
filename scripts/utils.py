@@ -263,7 +263,7 @@ def load_flow_samples(fname, recalc_avg=None, attrs_to_cut_by=None):
     return d
 
 
-def get_model_values(
+def get_phi_values(
     phi_model: Any,
     q_eval: ArrayLike,
     batch_size: int = 131072,
@@ -791,7 +791,7 @@ def get_index_of_points_inside_attrs(
         if "r_in" in attrs:
             r_in = attrs["r_in"]
         else:
-            r_in = 1 / attrs["parallax_max"]
+            r_in = 0
         idx = (r >= r_in) & (r <= r_out)
     elif attrs["volume_type"] == "cylinder":
         R_out, H_out = attrs["R_out"], attrs["H_out"]

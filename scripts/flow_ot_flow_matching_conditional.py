@@ -49,7 +49,7 @@ def logit_normal_scheduler(
     return jax.scipy.special.expit(x)
 
 
-def get_time_scheduler(scheduler_type: str):
+def get_time_scheduler(scheduler_type: str, power_law: float = 2.0):
     """
     Factory function to get a time scheduler by name.
 
@@ -61,7 +61,7 @@ def get_time_scheduler(scheduler_type: str):
     """
     schedulers = {
         "uniform": uniform_scheduler,
-        "power_law": power_law_scheduler,
+        "power_law": lambda key, shape: power_law_scheduler(key, shape, p = power_law),
         "logit_normal": logit_normal_scheduler,
     }
     if scheduler_type is None:
@@ -159,7 +159,6 @@ class NormalizingFlow(eqx.Module):
             condition = (condition - self.cond_mean) / self.cond_std
         return self.flow.log_prob(x, condition)
 
-    @eqx.filter_jit
     def sample(self, key: PRNGKeyArray, num_samples: int, condition: Optional[Array] = None) -> Array:
         if condition is not None:
             # For conditional sampling, flowjax expects condition.shape[0] == num_samples
@@ -247,6 +246,11 @@ class ConditionalPhaseSpaceFlow(eqx.Module):
     def sample_position(self, key: PRNGKeyArray, num_samples: int) -> Array:
         """Samples only the position part from the spatial flow."""
         return self.spatial_flow.sample(key, num_samples)
+    
+    @eqx.filter_jit
+    def sample_velocity_given_position(self, key: PRNGKeyArray, x: Array) -> Array:
+        """Samples only the velocity part from the conditional velocity flow given position x."""
+        return self.conditional_velocity_flow.sample(key, x.shape[0], condition=x)
 
     def save(self, save_prefix: str = "flow", loss_history: Optional[dict] = None):
         """Saves the model with a specific prefix for the checkpoint files."""
@@ -579,6 +583,7 @@ def train_ot_flow_matching_model(
     batch_size: int,
     ot_pairings_dir: Path,
     time_scheduler_type=None,
+    time_scheduler_param=2.0,
     loss_params={},
     time_logger=None,
     loss_history=None,
@@ -624,7 +629,7 @@ def train_ot_flow_matching_model(
     path_val_ot = ot_pairings_dir / "val_epochs"
     x0_x1_val_indices_loader = PrecomputedOTDataLoader(path_val_ot, n=n_val, x1_data=val_x, w1_weights=val_weights, x1_cond=None)
 
-    time_scheduler = get_time_scheduler(time_scheduler_type)
+    time_scheduler = get_time_scheduler(time_scheduler_type, time_scheduler_param)
 
     # --- Partition Model into trainable/non-trainable parts and initialize the optimizer ---
     params, static = eqx.partition(dynamics_net, filter_spec=custom_filter_spec(dynamics_net))
@@ -641,6 +646,7 @@ def train_ot_flow_matching_model(
     print(f"Number of steps per epoch: {steps_per_epoch}, Batch size: {batch_size}")
     print(f"Number of epochs: {epochs}, Total training samples: {n_train}")
     print(f"Using time scheduler of type {time_scheduler}")
+    print(f"Using time scheduler parameter: {time_scheduler_param}")
     print(f"Using loss params {loss_params}")
     start_epoch = len(loss_history[lr_label])
     step = start_epoch * steps_per_epoch  # Continue from previous step if resuming

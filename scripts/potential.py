@@ -404,15 +404,19 @@ class IntFourierMLP(eqx.Module):
 
 class PhiNN(eqx.Module):
     """
-    A feed-forward neural network to represent the gravitational potential Phi(q).
+    A model to represent the gravitational potential Phi(q).
+
+    Supports both neural network models (ResNet, MLP, etc.) and analytic models
+    (Miyamoto-Nagai disks + NFW halo).
 
     Attributes:
-        net (ResMLP): The core neural network model.
+        net: The core model (neural network or AnalyticPotential).
         scale (Array): A non-trainable scaling factor applied to input coordinates
-                       for normalization purposes.
+                       for normalization purposes (only used for neural networks).
+        type (str): The model type.
     """
-    net: ResMLP
-    scale: Array # Not trainable
+    net: eqx.Module
+    scale: Array  # Not trainable
     type: str = eqx.field(static=True)
 
     def __init__(self, key, params):
@@ -422,43 +426,69 @@ class PhiNN(eqx.Module):
         Args:
             key (PRNGKeyArray): JAX random key for MLP initialization.
             params (dict): Dictionary containing model parameters:
-                - n_dim (int): The dimensionality of the input space (typically 3).
-                - depth (int): The number of residual blocks in the MLP.
-                - width (int): The width of the hidden layers in the MLP.
-                - scale (Optional[Array]): A vector of scales for each input coordinate.
-                                         If None, defaults to ones.
-                - model_type (str): Type of model, either 'ResNet' or 'MLP'.
+                - type (str): Model type. Options:
+                    - 'ResNet': Residual MLP
+                    - 'MLP': Standard MLP
+                    - 'Analytic': Miyamoto-Nagai + NFW analytic potential
+                - For neural network types:
+                    - depth (int): The number of residual blocks in the MLP.
+                    - width (int): The width of the hidden layers in the MLP.
+                    - scale (Optional[Array]): A vector of scales for each input coordinate.
+                - For 'Analytic' type:
+                    - r_c (float): Distance to galactic center in kpc (default 8.277).
+                    - dz (float): Vertical offset in kpc (default 0.0).
+                    - dz_trainable (bool): Whether dz is trainable (default False).
+                    - mn1_amp, mn1_a, mn1_b, mn1_*_trainable: First Miyamoto-Nagai disk params.
+                    - mn2_amp, mn2_a, mn2_b, mn2_*_trainable: Second Miyamoto-Nagai disk params.
+                    - mn3_amp, mn3_a, mn3_b, mn3_*_trainable: Third Miyamoto-Nagai disk params.
+                    - halo_amp, halo_a, halo_*_trainable: NFW halo params.
         """
         super().__init__()
 
-        width = params["width"]
-        depth = params["depth"]
-        model_type = params["type"]
-        scale = params.get("scale", None)
+        model_type = params.get("type")
         in_size = 3
+        scale = params.get("scale", jnp.ones(in_size))
 
-        if model_type == 'ResNet':
-            self.net = ResMLP(
-                in_size=in_size, out_size=1, width_size=width,
-                depth=depth, key=key,
-            )
-        elif model_type == 'MLP':
-            self.net = eqx.nn.MLP(
-                in_size=in_size, out_size=1, width_size=width,
-                depth=depth, activation=jax.nn.tanh, key=key,
-            )
+        if model_type == 'Analytic':
+            # Import here to avoid circular imports
+            from potential_analytic import AnalyticPotential
+
+            self.net = AnalyticPotential(**params)
+            # Scale not used for analytic potential
+            self.scale = jnp.ones(in_size)
+        else:
+            # Neural network models
+            width = params["width"]
+            depth = params["depth"]
+
+            if model_type == 'ResNet':
+                self.net = ResMLP(
+                    in_size=in_size, out_size=1, width_size=width,
+                    depth=depth, key=key,
+                )
+            elif model_type == 'MLP':
+                self.net = eqx.nn.MLP(
+                    in_size=in_size, out_size=1, width_size=width,
+                    depth=depth, activation=jax.nn.tanh, key=key,
+                )
+            else:
+                raise ValueError(f"Unknown model type: {model_type}")
+
+            print(f"Initializing neural network ({model_type}) with coordinate scale {scale}")
+            if scale is None:
+                coord_scale = jnp.ones(in_size)
+            else:
+                coord_scale = jnp.array(scale)
+            self.scale = 1 / coord_scale
+
         self.type = model_type
 
-        print(f"Initializing the neural network with coordinate scale {scale}")
-        if scale is None:
-            coord_scale = jnp.ones(in_size)
-        else:
-            coord_scale = jnp.array(scale)
-        self.scale = 1 / coord_scale
-
     def __call__(self, q):
-        """Returns the gravitational potential"""
-        return self.net(self.scale * q).squeeze()
+        """Returns the gravitational potential."""
+        if self.type == 'Analytic':
+            return self.net(q)
+        else:
+            return self.net(self.scale * q).squeeze()
 
     def count_parameters(self):
         """Counts the total number of trainable parameters in the model."""
@@ -942,7 +972,8 @@ def get_phi_loss(
         prior_pos = jnp.clip(d2phi_dq2, a_min=0.0)
         likelihood = likelihood + gamma * prior_pos
 
-    loss = jnp.log(jnp.mean(likelihood))
+    # loss = jnp.log(jnp.mean(likelihood))
+    loss = jnp.mean(likelihood)
     loss_noreg = loss
 
     def get_l2_loss(net, l2):

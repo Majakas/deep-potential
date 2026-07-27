@@ -26,6 +26,7 @@ def train_flow_matching_model(
     epochs: int,
     batch_size: int,
     time_scheduler_type="uniform",
+    time_scheduler_param=2.0,
     loss_params={},
     time_logger=None,
     loss_history=None,
@@ -43,17 +44,21 @@ def train_flow_matching_model(
     val_x = (val_data['eta'] - norm_mean) / norm_std
     val_weights = val_data['weights']
 
+    # The position/velocity split is taken from the model's spatial dimension so that
+    # this loop works for any phase-space dimension (6D -> pos_dim=3, the 4D mock -> 2).
+    pos_dim = model.spatial_flow.metadata['input_dim']
+
     if which_flow == "spatial":
         print("--- Training spatial flow n(x) with standard Flow Matching ---")
         train_x_cond, val_x_cond = None, None
-        train_x, val_x = train_x[:, :3], val_x[:, :3]
+        train_x, val_x = train_x[:, :pos_dim], val_x[:, :pos_dim]
         dynamics_net = model.spatial_flow.flow.bijection[0].dynamics_net
         train_label, val_label, lr_label, grads_label = 'train_pos', 'val_pos', 'lr_pos', 'global_grad_norms_pos'
         flow_save_prefix = 'flow_pos_only'
     elif which_flow == "conditional_velocity":
         print("--- Training conditional velocity flow f(v|x) with standard Flow Matching ---")
-        train_x_cond, val_x_cond = train_x[:, :3], val_x[:, :3]
-        train_x, val_x = train_x[:, 3:], val_x[:, 3:]
+        train_x_cond, val_x_cond = train_x[:, :pos_dim], val_x[:, :pos_dim]
+        train_x, val_x = train_x[:, pos_dim:], val_x[:, pos_dim:]
         dynamics_net = model.conditional_velocity_flow.flow.bijection[0].dynamics_net
         train_label, val_label, lr_label, grads_label = 'train_vel', 'val_vel', 'lr_vel', 'global_grad_norms_vel'
         flow_save_prefix = 'flow'
@@ -72,7 +77,7 @@ def train_flow_matching_model(
     val_batch_size = batch_size
 
     # --- Setup Schedulers, Optimizer, and Model Partition ---
-    time_scheduler = get_time_scheduler(time_scheduler_type)
+    time_scheduler = get_time_scheduler(time_scheduler_type, time_scheduler_param)
 
     # --- Partition Model into trainable/non-trainable parts and initialize the optimizer ---
     params, static = eqx.partition(dynamics_net, filter_spec=custom_filter_spec(dynamics_net))
@@ -90,7 +95,7 @@ def train_flow_matching_model(
     print(f"Number of trainable parameters: {model.count_parameters()}")
     print(f"Number of steps per epoch: {steps_per_epoch}, Batch size: {batch_size}")
     print(f"Number of epochs: {epochs}, Total training samples: {n_train}")
-    print(f"Using time scheduler of type {time_scheduler_type}")
+    print(f"Using time scheduler of type {time_scheduler_type} with parameter {time_scheduler_param}")
     print(f"Using loss params {loss_params}")
 
     # --- Training Loop ---

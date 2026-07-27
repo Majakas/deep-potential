@@ -29,7 +29,7 @@ def _block_average_df_data(df_datas, block_size):
     Average consecutive blocks of flow data.
 
     Args:
-        df_datas: List of dictionaries containing 'f' and 'df_deta' arrays
+        df_datas: List of dictionaries containing 'lnf' and 'dlnf_deta' arrays
         block_size: Number of consecutive flows to average
 
     Returns:
@@ -37,9 +37,14 @@ def _block_average_df_data(df_datas, block_size):
     """
     df_datas_reduced = []
     for i in range(0, len(df_datas), block_size):
+        # For lnf, average in linear space: log(mean(exp(lnf)))
+        lnf_stack = np.stack([x['lnf'] for x in df_datas[i:i + block_size]], axis=1)
+        lnf_avg = np.log(np.mean(np.exp(lnf_stack), axis=1))
+        # For dlnf_deta (= df_deta / f), average directly (not a log quantity)
+        dlnf_deta_avg = np.mean(np.stack([x['dlnf_deta'] for x in df_datas[i:i + block_size]], axis=2), axis=2)
         df_datas_reduced.append({
-            'f': np.mean(np.stack([x['f'] for x in df_datas[i:i + block_size]], axis=1), axis=1),
-            'df_deta': np.mean(np.stack([x['df_deta'] for x in df_datas[i:i + block_size]], axis=2), axis=2),
+            'lnf': lnf_avg,
+            'dlnf_deta': dlnf_deta_avg,
         })
     return df_datas_reduced
 
@@ -49,12 +54,12 @@ def _compute_deltas(df_datas_reduced, mode='cyclic', df_data_reference=None):
     Compute differences between flow data.
 
     Args:
-        df_datas_reduced: Block-averaged flow data
+        df_datas_reduced: Block-averaged flow data (with 'lnf' and 'dlnf_deta')
         mode: 'cyclic' for consecutive comparisons, 'reference' for reference-based
         df_data_reference: Reference data (required for 'reference' mode)
 
     Returns:
-        List of delta dictionaries
+        List of delta dictionaries with relative differences
     """
     delta_f = []
     for i in range(len(df_datas_reduced)):
@@ -64,13 +69,13 @@ def _compute_deltas(df_datas_reduced, mode='cyclic', df_data_reference=None):
             i_n = (i + 1) % len(df_datas_reduced)
             x_ref = df_datas_reduced[i_n]
             delta_f.append({
-                'f': x_ref['f'] / x['f'] - 1,
-                'df_deta': x_ref['df_deta'] / x['df_deta'] - 1,
+                'lnf': x_ref['lnf'] - x['lnf'],
+                'ln_dlnf_deta': np.log(np.abs(x_ref['dlnf_deta'])) - np.log(np.abs(x['dlnf_deta'])),
             })
         else:  # reference mode
             delta_f.append({
-                'f': df_data_reference['f'] / x['f'] - 1,
-                'df_deta': x['df_deta'] / df_data_reference['df_deta'] - 1,
+                'lnf': df_data_reference['lnf'] - x['lnf'],
+                'ln_dlnf_deta': np.log(np.abs(x['dlnf_deta'])) - np.log(np.abs(df_data_reference['dlnf_deta'])),
             })
     return delta_f
 
@@ -93,25 +98,25 @@ def _plot_gradient_histograms(delta_f, df_datas_reduced, block_size, mode, fig_d
     ax_top = fig.add_subplot(gs[0, :])
     axs = [ax_top] + [fig.add_subplot(gs[r, c]) for r in range(1, 3) for c in range(3)]
 
-    # Plot for f
-    df = np.stack([x['f'] for x in delta_f], axis=-1)
-    std_df = std(df, axis=0)
+    # Plot for lnf
+    delta_lnf = np.stack([x['lnf'] for x in delta_f], axis=-1)
+    std_lnf = std(delta_lnf, axis=0)
     ax = axs[0]
-    for i in range(df.shape[1]):
-        ax.hist(df[:,i], bins=get_bins(df.flatten()), histtype='step', density=True)
-    ax.set_title(f'Mean Standard Deviation = {std_df.mean():.3f}')
-    ax.set_xlabel(r'$\Delta f / f$')
+    for i in range(delta_lnf.shape[1]):
+        ax.hist(delta_lnf[:,i], bins=get_bins(delta_lnf.flatten()), histtype='step', density=True)
+    ax.set_title(f'Mean Standard Deviation = {std_lnf.mean():.3f}')
+    ax.set_xlabel(r'$\Delta \ln f$')
 
-    # Plot for each dimension of df_deta
+    # Plot for each dimension of ln_dlnf_deta
     labels = ['x', 'y', 'z', 'v_x', 'v_y', 'v_z']
     for j in range(6):
-        df_deta_dim = np.stack([x['df_deta'][:,j] for x in delta_f], axis=1)
-        std_df_deta_dim = std(df_deta_dim, axis=0)
+        ln_dlnf_deta_dim = np.stack([x['ln_dlnf_deta'][:,j] for x in delta_f], axis=1)
+        std_ln_dlnf_deta_dim = std(ln_dlnf_deta_dim, axis=0)
         ax = axs[1 + j]
         for i in range(len(df_datas_reduced)):
-            ax.hist(df_deta_dim[:,i], bins=get_bins(df_deta_dim.flatten()), histtype='step', density=True)
-        ax.set_title(f'Mean Std Dev = {std_df_deta_dim.mean():.3f}')
-        ax.set_xlabel(f'$\Delta(\partial f / \partial {labels[j]}) / (\partial f / \partial {labels[j]})$')
+            ax.hist(ln_dlnf_deta_dim[:,i], bins=get_bins(ln_dlnf_deta_dim.flatten()), histtype='step', density=True)
+        ax.set_title(f'Mean Std Dev = {std_ln_dlnf_deta_dim.mean():.3f}')
+        ax.set_xlabel(rf'$\Delta \ln |\partial \ln f / \partial {labels[j]}|$')
 
     for ax in axs:
         ax.xaxis.set_minor_locator(ticker.AutoMinorLocator(5))
@@ -138,7 +143,7 @@ def plot_df_gradients_comparison(df_datas, block_size, fig_dir, fig_fmt=('png',)
     Generates and saves a plot comparing gradients of the distribution function.
 
     Args:
-        df_datas: List of dictionaries, each containing 'eta', 'df_deta', and 'f' arrays
+        df_datas: List of dictionaries, each containing 'eta', 'lnf', and 'dlnf_deta' arrays
         block_size: Number of consecutive flows to average before computing differences
         fig_dir: Directory to save the output plot
         fig_fmt: Tuple of output formats (e.g., ('png',))

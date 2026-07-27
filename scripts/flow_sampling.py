@@ -88,7 +88,100 @@ def sample_from_different_flows(
     return eta
 
 
-def calculate_log_prob_and_derivatives(eta, flow_list, attrs_list, grad_batch_size=500):
+def sample_uniformly_within_mask(
+    key,
+    flow_list,
+    attrs_list,
+    fname_mask=None,
+    n_samples=10000,
+    sample_batch_size=5000,
+):
+    """
+    Samples uniformly within a defined volume for the spatial component. Works in two
+    mutually exclusive regimes. If fname_mask is not None, then uniformly samples within
+    the mask. If r_out is not None, then uniformly samples within a sphere of radius r_out.
+    The velocity component is sampled using the conditional component of the flow.
+    """
+    if sample_batch_size == -1:
+        sample_batch_size = n_samples
+    r_out = attrs_list[0]['r_out']
+    if "r_in" not in attrs_list[0]:
+        r_in = 0.0
+    else:
+        r_in = attrs_list[0]['r_in']
+
+    rng = np.random.default_rng()
+
+    q_grids = []
+    n_done = 0
+    n_all = 0
+    while n_done < n_samples:
+        u = rng.random(sample_batch_size)
+        costheta = 2 * rng.random(sample_batch_size) - 1
+        phi = 2 * np.pi * rng.random(sample_batch_size)
+
+        theta = np.arccos(costheta)
+
+        r = ((u * (r_out**3 - r_in**3)) + r_in**3)**(1/3)
+
+        x_grid = r * np.sin(theta) * np.cos(phi)
+        y_grid = r * np.sin(theta) * np.sin(phi)
+        z_grid = r * np.cos(theta)
+
+        q_grid = np.zeros(shape=(sample_batch_size, 3), dtype='f4')
+        q_grid[:,0] = x_grid
+        q_grid[:,1] = y_grid
+        q_grid[:,2] = z_grid
+
+        if fname_mask is not None:
+            mask_grid = utils.get_mask_eta(q_grid, fname_mask, r_min=r_in, r_max=r_out)[0]
+            q_grid = q_grid[mask_grid]
+
+        q_grids.append(q_grid)
+        n_done += len(q_grid)
+        n_all += sample_batch_size
+
+    q_grids = np.concatenate(q_grids, axis=0)
+
+    # Sample velocities evenly from the flow models
+    v_grids = []
+    n_samples_per_flow = len(q_grids) // len(flow_list)
+
+    total_batches = sum(
+        -(-((len(q_grids) if i == len(flow_list) - 1 else n_samples_per_flow)) // sample_batch_size)
+        for i in range(len(flow_list))
+    )
+    print("Sampling velocities from flows..")
+    with tqdm(total=total_batches, desc="Sampling velocities") as pbar:
+        for i, flow in enumerate(flow_list):
+            # Determine which positions this flow should sample velocities for
+            start_idx = i * n_samples_per_flow
+            end_idx = start_idx + n_samples_per_flow if i < len(flow_list) - 1 else len(q_grids)
+            q_subset = q_grids[start_idx:end_idx]
+
+            # Sample velocities in batches
+            v_batches = []
+            n_q = len(q_subset)
+            n_batches = -(-n_q // sample_batch_size)
+            for b in range(n_batches):
+                q_batch = q_subset[b * sample_batch_size: (b + 1) * sample_batch_size]
+                key, vel_key = jax.random.split(key)
+                v_batch = np.array(flow.sample_velocity_given_position(vel_key, q_batch))
+                v_batches.append(v_batch)
+                pbar.update(1)
+
+            v_grids.append(np.concatenate(v_batches, axis=0))
+            jax.clear_caches()
+
+    v_grids = np.concatenate(v_grids, axis=0)
+
+    # Combine positions and velocities into full phase space
+    eta = np.concatenate([q_grids, v_grids], axis=1)
+
+    return eta
+
+
+def calculate_log_prob_and_derivatives(eta, flow_list, attrs_list, ignore_nobs=False, grad_batch_size=500):
     """
     Calculates lnf, dlnf/deta, and dlnp/deta for a given sample of phase-space points eta.
     """
@@ -108,10 +201,11 @@ def calculate_log_prob_and_derivatives(eta, flow_list, attrs_list, grad_batch_si
             for k in range(n_batches):
                 eta_batch = eta[k * grad_batch_size: (k + 1) * grad_batch_size]
 
-                # Calculate lnf and dlnf_deta
-                lnf_batch, dlnf_deta_batch = value_and_grad_lnf_fn(flow, eta_batch)
-                lnf.append(lnf_batch)
-                dlnf_deta.append(dlnf_deta_batch)
+                if not ignore_nobs:
+                    # Calculate lnf and dlnf_deta
+                    lnf_batch, dlnf_deta_batch = value_and_grad_lnf_fn(flow, eta_batch)
+                    lnf.append(lnf_batch)
+                    dlnf_deta.append(dlnf_deta_batch)
 
                 # Calculate dlnp_deta
                 lnp_batch, dlnp_deta_batch = value_and_grad_lnp_fn(flow, eta_batch)
@@ -120,8 +214,9 @@ def calculate_log_prob_and_derivatives(eta, flow_list, attrs_list, grad_batch_si
 
                 pbar.update(1)
 
-            dlnf_deta = np.concatenate([np.array(b) for b in dlnf_deta])
-            lnf = np.concatenate([np.array(b) for b in lnf])
+            if not ignore_nobs:
+                dlnf_deta = np.concatenate([np.array(b) for b in dlnf_deta])
+                lnf = np.concatenate([np.array(b) for b in lnf])
             dlnp_deta = np.concatenate([np.array(b) for b in dlnp_deta])
             lnp = np.concatenate([np.array(b) for b in lnp])
 
@@ -129,15 +224,20 @@ def calculate_log_prob_and_derivatives(eta, flow_list, attrs_list, grad_batch_si
                 print(f'Flow {i+1} has spatial cut. Applying it to gradients and log probabilities.')
                 # Replace all out-of-bounds values with np.nan. That way, np.nanmean ignores them.
                 idx = utils.get_index_of_points_inside_attrs(eta, attrs_list[i])
-                dlnf_deta[~idx] = np.nan
-                lnf[~idx] = np.nan
+                if not ignore_nobs:
+                    dlnf_deta[~idx] = np.nan
+                    lnf[~idx] = np.nan
                 dlnp_deta[~idx] = np.nan
                 lnp[~idx] = np.nan
 
-            dlnf_deta_list[i] = dlnf_deta
-            lnf_list[i] = lnf
             dlnp_deta_list[i] = dlnp_deta
             lnp_list[i] = lnp
+            if not ignore_nobs:
+                dlnf_deta_list[i] = dlnf_deta
+                lnf_list[i] = lnf
+            else:
+                dlnf_deta_list[i] = dlnp_deta
+                lnf_list[i] = lnp
 
     return lnf_list, dlnf_deta_list, lnp_list, dlnp_deta_list
 
@@ -210,7 +310,7 @@ def robust_mean(data, sigma=5.0, max_iter=5, axis=None, use_mad=True):
 def combine_log_prob_and_derivatives(lnf_list, dlnf_deta_list, lnp_list, dlnp_deta_list):
     """
     Returns the combined gradients and log probabilities over multiple flows. We do this
-    by taking the mean of the gradients and log probabilities at each point, ignoring
+    by taking the mean of the gradients and probabilities at each point, ignoring
     out-of-bounds values (which are already set to np.nan).
 
     Before combining the flows, we perform outlier rejection based on how similar the flows are to
@@ -237,10 +337,17 @@ def combine_log_prob_and_derivatives(lnf_list, dlnf_deta_list, lnp_list, dlnp_de
 
         # Create a masked array to perform the final robust mean
         # We mask entire flows, not individual points
-        lnf_best = robust_mean(lnf_list[~idx_rejected], axis=0)
-        dlnf_deta_best = robust_mean(dlnf_deta_list[~idx_rejected], axis=0)
-        lnp_best = robust_mean(lnp_list[~idx_rejected], axis=0)
-        dlnp_deta_best = robust_mean(dlnp_deta_list[~idx_rejected], axis=0)
+        # The mean is taken for the non-log quantities, then converted back to log
+        lnf_best = np.log(np.nanmean(np.exp(lnf_list[~idx_rejected]), axis=0))
+        dlnf_deta_best = 1 / np.exp(lnf_best)[:, None] * robust_mean(
+            np.exp(lnf_list[~idx_rejected])[:, :, None] * dlnf_deta_list[~idx_rejected],
+            axis=0,
+        )
+        lnp_best = np.log(np.nanmean(np.exp(lnp_list[~idx_rejected]), axis=0))
+        dlnp_deta_best = 1 / np.exp(lnp_best)[:, None] * robust_mean(
+            np.exp(lnp_list[~idx_rejected])[:, :, None] * dlnp_deta_list[~idx_rejected],
+            axis=0,
+        )
 
     else:
         lnf_best = lnf_list[0]
@@ -258,15 +365,26 @@ def sample_and_calculate_log_prob_derivatives(
     n_samples,
     grad_batch_size=500,
     sample_batch_size=5000,
+    ignore_nobs=False,
+    fraction_sampled_spatially_uniformly=0.0,
+    fname_mask=None
 ):
     """
     Samples from different flows, calculates log probabilities and their derivatives,
     and combines them.
     """
     key = jax.random.key(seed)
-    eta = sample_from_different_flows(key, flow_list, attrs_list, n_samples, sample_batch_size)
+    n_uniform_samples = int(fraction_sampled_spatially_uniformly * n_samples)
+    n_flow_samples = n_samples - n_uniform_samples
+    eta = []
+    if n_uniform_samples > 0:
+        key, uniform_key = jax.random.split(key)
+        eta.append(sample_uniformly_within_mask(uniform_key, flow_list, attrs_list, fname_mask, n_uniform_samples, sample_batch_size))
+    if n_flow_samples > 0:
+        eta.append(sample_from_different_flows(key, flow_list, attrs_list, n_flow_samples, sample_batch_size))
+    eta = np.concatenate(eta, axis=0)
 
-    lnf_list, dlnf_deta_list, lnp_list, dlnp_deta_list = calculate_log_prob_and_derivatives(eta, flow_list, attrs_list, grad_batch_size)
+    lnf_list, dlnf_deta_list, lnp_list, dlnp_deta_list = calculate_log_prob_and_derivatives(eta, flow_list, attrs_list, ignore_nobs, grad_batch_size)
 
     lnf, dlnf_deta, lnp, dlnp_deta = combine_log_prob_and_derivatives(np.array(lnf_list), np.array(dlnf_deta_list), np.array(lnp_list), np.array(dlnp_deta_list))
 
@@ -321,6 +439,23 @@ if __name__ == "__main__":
         help="JSON with kwargs.",
         default="options.json"
     )
+    parser.add_argument(
+        "--ignore-nobs",
+        action="store_true",
+        help="Assume lnn=0 when calculating gradients and log probabilities.",
+    )
+    parser.add_argument(
+        "--fraction-sampled-spatially-uniformly",
+        type=float,
+        default=0.0,
+        help="Fraction of samples to be drawn spatially uniformly within the mask, instead of from the flow. Can help in phase space volumes with low density so they get more emphasis when training the gravitational potential."
+    )
+    parser.add_argument(
+        "--fname-mask",
+        type=str,
+        default=None,
+        help="Filename of the mask to sample uniformly within. Only used if fraction_sampled_spatially_uniformly > 0."
+    )
     args = parser.parse_args()
 
     def expand_inputs(inputs):
@@ -359,8 +494,18 @@ if __name__ == "__main__":
             key = jax.random.key(args.seed)
             params = utils.load_params(args.params)
 
+            n_samples = params['flow_sampling']['n_samples']
+            batch_size = params['flow_sampling']['sample_batch_size']
             print('Extracting samples from flows')
-            eta = sample_from_different_flows(key, flow_list, attrs_list, params['flow_sampling']['n_samples'], params['flow_sampling']['sample_batch_size'])
+            n_uniform_samples = int(args.fraction_sampled_spatially_uniformly * n_samples)
+            n_flow_samples = n_samples - n_uniform_samples
+            eta = []
+            if n_uniform_samples > 0:
+                key, uniform_key = jax.random.split(key)
+                eta.append(sample_uniformly_within_mask(uniform_key, flow_list, attrs_list, args.fname_mask, n_uniform_samples, batch_size))
+            if n_flow_samples > 0:
+                eta.append(sample_from_different_flows(key, flow_list, attrs_list, n_flow_samples, batch_size))
+            eta = np.concatenate(eta, axis=0)
 
             # Save the samples
             print(f'Saving samples to {df_samples_fname}')
@@ -390,7 +535,7 @@ if __name__ == "__main__":
                 print(f'Calculating gradients for flow {i+1}/{n_flows}')
                 params = utils.load_params(args.params)
                 grad_batch_size = params['flow_sampling']['grad_batch_size']
-                lnf_list, dlnf_deta_list, lnp_list, dlnp_deta_list = calculate_log_prob_and_derivatives(eta, [flow_list[i]], [attrs_list[i]], grad_batch_size)
+                lnf_list, dlnf_deta_list, lnp_list, dlnp_deta_list = calculate_log_prob_and_derivatives(eta, [flow_list[i]], [attrs_list[i]], args.ignore_nobs, grad_batch_size)
 
                 print(f'Saving derivatives to {df_grads_fname}')
                 fit_all.save_df_data({'eta': eta, 'lnf': lnf_list[0], 'dlnf_deta': dlnf_deta_list[0], 'lnp': lnp_list[0], 'dlnp_deta': dlnp_deta_list[0]}, df_grads_fname)

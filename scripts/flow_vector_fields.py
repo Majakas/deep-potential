@@ -186,6 +186,155 @@ class FourierTimeResMLP(eqx.Module):
         return self.mlp(net_input)
 
 
+class FilmResBlock(eqx.Module):
+    """A residual block with FiLM conditioning (Feature-wise Linear Modulation)."""
+    fn: eqx.Module
+
+    def __init__(self, width_size: int, key: PRNGKeyArray):
+        key1, key2 = jax.random.split(key)
+        self.fn = eqx.nn.Sequential([
+            eqx.nn.Linear(width_size, width_size, key=key1),
+            eqx.nn.Lambda(jax.nn.silu),
+            eqx.nn.Linear(width_size, width_size, key=key2),
+        ])
+
+    def __call__(self, x: Array, gamma: Array, beta: Array) -> Array:
+        h = self.fn(x)
+        h = gamma * h + beta  # FiLM modulation
+        return x + h
+
+
+class FilmResMLP(eqx.Module):
+    """A ResMLP with FiLM conditioning applied at each residual block."""
+    initial_layer: eqx.nn.Linear
+    blocks: list[FilmResBlock]
+    final_layer: eqx.nn.Linear
+    depth: int = eqx.field(static=True)
+    width_size: int = eqx.field(static=True)
+
+    def __init__(
+        self,
+        in_size: int,
+        out_size: int,
+        width_size: int,
+        depth: int,
+        key: PRNGKeyArray,
+    ):
+        init_key, final_key, *block_keys = jax.random.split(key, 2 + depth)
+
+        self.depth = depth
+        self.width_size = width_size
+        self.initial_layer = eqx.nn.Linear(in_size, width_size, key=init_key)
+        self.blocks = [FilmResBlock(width_size, key=k) for k in block_keys]
+        self.final_layer = eqx.nn.Linear(width_size, out_size, key=final_key)
+
+    def __call__(self, x: Array, gammas: Array, betas: Array) -> Array:
+        """
+        Args:
+            x: Input tensor
+            gammas: FiLM scale parameters, shape (depth, width_size)
+            betas: FiLM shift parameters, shape (depth, width_size)
+        """
+        h = jax.nn.silu(self.initial_layer(x))
+
+        for i, block in enumerate(self.blocks):
+            h = block(h, gammas[i], betas[i])
+
+        return self.final_layer(h)
+
+
+class FilmFourierResMLP(eqx.Module):
+    """FourierTimeResMLP with FiLM conditioning on position.
+
+    The position is encoded and passed through a conditioning network that
+    produces scale (gamma) and shift (beta) parameters for each residual block.
+    This allows the network to modulate its features based on spatial location.
+    """
+    time_encoder: FourierFeatures
+    pos_encoder: FourierFeatures
+    film_net: eqx.nn.MLP
+    mlp: FilmResMLP
+
+    pos_dim: int = eqx.field(static=True)
+    depth: int = eqx.field(static=True)
+    width_size: int = eqx.field(static=True)
+
+    def __init__(
+        self,
+        key,
+        input_dim: int,
+        width_size: int,
+        depth: int,
+        time_embedding_dim: int = 32,
+        pos_embedding_dim: int = 32,
+        pos_max_freq: float = 1024.0,
+        film_width: int = 128,
+        film_depth: int = 2,
+        cond_dim: int = 0,
+    ):
+        film_key, mlp_key = jax.random.split(key)
+
+        self.pos_dim = input_dim // 2
+        self.depth = depth
+        self.width_size = width_size
+
+        self.time_encoder = FourierFeatures(
+            in_dim=1,
+            num_freqs=time_embedding_dim // 2,
+            max_freq=1024.0,
+            include_self=False,
+        )
+
+        self.pos_encoder = FourierFeatures(
+            in_dim=self.pos_dim,
+            num_freqs=pos_embedding_dim // 2,
+            max_freq=pos_max_freq,
+            include_self=True,
+        )
+
+        # FiLM conditioning network: maps position embedding to (gamma, beta) for each layer
+        # Output: depth * width_size * 2 (gamma and beta for each block)
+        film_out_size = depth * width_size * 2
+        self.film_net = eqx.nn.MLP(
+            in_size=self.pos_encoder.out_dim,
+            out_size=film_out_size,
+            width_size=film_width,
+            depth=film_depth,
+            activation=jax.nn.silu,
+            key=film_key,
+        )
+
+        self.mlp = FilmResMLP(
+            in_size=input_dim + time_embedding_dim + cond_dim,
+            out_size=input_dim,
+            width_size=width_size,
+            depth=depth,
+            key=mlp_key,
+        )
+
+    def __call__(self, t: Float, z: Array, condition: Optional[Array] = None) -> Array:
+        # Extract position and encode it
+        pos = z[:self.pos_dim]
+        pos_emb = self.pos_encoder(pos)
+
+        # Generate FiLM parameters from position
+        film_params = self.film_net(pos_emb)
+        # Reshape to (depth, width_size, 2) then split into gamma and beta
+        film_params = film_params.reshape(self.depth, self.width_size, 2)
+        # Initialize gamma around 1 and beta around 0 for stable training
+        gammas = 1.0 + film_params[..., 0]  # (depth, width_size)
+        betas = film_params[..., 1]  # (depth, width_size)
+
+        # Prepare main network input
+        t_emb = self.time_encoder(t)
+        net_input = [t_emb, z]
+        if condition is not None:
+            net_input.append(condition)
+        net_input = jnp.concatenate(net_input, axis=-1)
+
+        return self.mlp(net_input, gammas, betas)
+
+
 class PosResMLP(eqx.Module):
     time_encoder: FourierFeatures
     pos_mlp: ResMLP
@@ -421,9 +570,9 @@ class FactorizedResMLP(eqx.Module):
 
 class SHPosTimeResMLP(eqx.Module):
     """Architecture 2: ResMLP with e3nn-jax Spherical Harmonic embedding."""
-    time_encoder: FourierFeatures = eqx.field(static=True)
+    time_encoder: FourierFeatures
     mlp: ResMLP
-    sh_irreps: e3nn.Irreps = eqx.field(static=True)
+    sh_irreps: e3nn.Irreps
     sh_max_l: int = eqx.field(static=True)
     pos_dim: int = eqx.field(static=True)
     vel_dim: int = eqx.field(static=True)
@@ -547,10 +696,10 @@ class RadialRBF(eqx.Module):
 
 class SHRadialEmbeddingResMLP(eqx.Module):
     """Architecture 4: ResMLP with Spherical harmonics in l, b and gaussian radial basis in r."""
-    time_encoder: FourierFeatures = eqx.field(static=True)
-    sh_irreps: e3nn.Irreps = eqx.field(static=True)
+    time_encoder: FourierFeatures
+    sh_irreps: e3nn.Irreps
     sh_max_l: int = eqx.field(static=True)
-    rad_encoder: RadialRBF = eqx.field(static=True)
+    rad_encoder: RadialRBF
     mlp: ResMLP
     pos_dim: int = eqx.field(static=True)
     vel_dim: int = eqx.field(static=True)
@@ -695,7 +844,7 @@ class IntFourierResNet(eqx.Module):
     pos_mean: Array
     pos_std: Array
     pos_encoder: Integrated3DFourierFeatures
-    time_encoder: FourierFeatures = eqx.field(static=True)
+    time_encoder: FourierFeatures
 
     def __init__(
             self, key, input_dim, width_size, depth, time_embedding_dim=32,
@@ -788,6 +937,16 @@ class VectorField(eqx.Module):
         elif model_type == "FourierTimeResMLP":
             self.dynamics_net = FourierTimeResMLP(
                 key, input_dim, width, depth, time_emb_dim, cond_dim
+            )
+        elif model_type == "FilmFourierResMLP":
+            self.dynamics_net = FilmFourierResMLP(
+                key, input_dim, width, depth,
+                time_embedding_dim=time_emb_dim,
+                pos_embedding_dim=params.get("pos_embedding_dim", 32),
+                pos_max_freq=params.get("pos_max_freq", 1024.0),
+                film_width=params.get("film_width", 128),
+                film_depth=params.get("film_depth", 2),
+                cond_dim=cond_dim
             )
         elif model_type == "PosResMLP":
             pos_width = params["nn_pos_width"]
